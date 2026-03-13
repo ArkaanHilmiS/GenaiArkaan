@@ -11,6 +11,8 @@ import { GoogleGenAI } from "@google/genai";
 // Import 'dotenv/config' --> otomatis membaca file .env dan memasukkan variabelnya ke process.env
 import 'dotenv/config';
 
+import cors from 'cors';
+
 // Membuat instance GoogleGenAI dengan API key dari environment variable
 // process.env.GEMINI_API_KEY --> mengambil nilai variabel GEMINI_API_KEY dari file .env
 const ai = new GoogleGenAI({
@@ -45,6 +47,8 @@ const upload = multer();
 // app.use() --> mendaftarkan middleware yang berlaku untuk semua route
 // express.json() --> middleware bawaan Express untuk mem-parse body request yang berformat JSON
 app.use(express.json());
+app.use(cors());
+app.use(express.static('public')); // untuk melayani file statis dari folder 'public'
 
 // Mendefinisikan route POST pada endpoint '/generate'
 // async (request, response) => { ... } --> arrow function async sebagai handler route
