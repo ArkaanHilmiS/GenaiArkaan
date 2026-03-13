@@ -217,6 +217,12 @@ app.post('/generate/text-from-audio', upload.single('audio'), async (request, re
     if (error.status === 400) {
       return response.status(400).json('Format audio tidak didukung!');
     }
+    if (error.status === 401) {
+      return response.status(401).json('Unauthorized, periksa API key Anda!');
+    }
+    if (error.status === 403) {
+      return response.status(403).json('Anda tidak memiliki izin untuk mengakses layanan AI!');
+    }
     if (error.status === 413) {
       return response.status(413).json('File audio terlalu besar!');
     }

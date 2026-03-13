@@ -8,7 +8,7 @@ catatan arkaan sendiri =
 7. tambahkan "type": "module" di package.json
 8. penjelasan restful api ada di https://restfulapi.net/ yang berfungsi untuk perantara (server) antara api gemini dan request aplikasi (user)
 9. cara run node index.js
-10. cek ListModels https://generativelanguage.googleapis.com/v1beta/models?key=AIzaSyDCI9B4BFUBWAuegTslom6zDOJiRwKpRlc atau https://ai.google.dev/api/models#models_list-SHELL
+10. cek ListModels https://generativelanguage.googleapis.com/v1beta/models?key=GEMINI_API_KEY atau https://ai.google.dev/api/models#models_list-SHELL
 11. 
 
 dari mas eas =
