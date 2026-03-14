@@ -1,270 +1,386 @@
-// Import modul 'express' --> framework untuk membuat web server & routing di Node.js
+// ============================================================
+// IMPORTS
+// ============================================================
 import express from 'express';
-
-// Import modul 'multer' --> middleware untuk menangani upload file (multipart/form-data)
 import multer from 'multer';
-
-// Import class 'GoogleGenAI' dari package Google GenAI --> SDK untuk mengakses model AI Google (Gemini)
-// Menggunakan destructuring { } karena hanya mengambil satu export dari modul tersebut
 import { GoogleGenAI } from "@google/genai";
-
-// Import 'dotenv/config' --> otomatis membaca file .env dan memasukkan variabelnya ke process.env
 import 'dotenv/config';
-
 import cors from 'cors';
 
-// Membuat instance GoogleGenAI dengan API key dari environment variable
-// process.env.GEMINI_API_KEY --> mengambil nilai variabel GEMINI_API_KEY dari file .env
+// ============================================================
+// INISIALISASI AI & KONFIGURASI
+// ============================================================
 const ai = new GoogleGenAI({
   apiKey: process.env.GEMINI_API_KEY,
 });
 
-// Objek konstanta berisi daftar nama model AI yang tersedia
-// Dipakai supaya tidak perlu menulis ulang string model secara manual
 const MODELS = {
   flashLite31: "gemini-3.1-flash-lite-preview",
   flash3: "gemini-3-flash-preview",
   pro: "gemini-3.1-pro-preview",
-  gemma3 : "gemma-3-27b-it"
+  gemma3: "gemma-3-27b-it"
 };
 
-// Menentukan port server: ambil dari env variable PORT, jika tidak ada gunakan default 3000
-// Operator || --> logical OR, jika sisi kiri falsy maka pakai sisi kanan
+// ============================================================
+// SYSTEM INSTRUCTION (Persona AI)
+// Ubah teks di bawah ini untuk mengganti kepribadian AI
+// ============================================================
+const SYSTEM_INSTRUCTION = `
+Kamu adalah Tomas, asisten AI yang cerdas, ramah, dan selalu siap membantu.
+
+Kepribadianmu:
+- Ramah dan hangat dalam berkomunikasi
+- Menjawab dengan bahasa yang jelas dan mudah dipahami
+- Jujur jika tidak tahu suatu hal
+- Sedikit humoris tapi tetap profesional
+
+Aturan:
+- Selalu jawab dalam Bahasa Indonesia kecuali user minta bahasa lain
+- Jangan pernah mengaku sebagai Google atau Gemini secara langsung
+- Jika ditanya siapa kamu, jawab bahwa kamu adalah Tomas
+- Berikan jawaban yang ringkas namun lengkap
+- Gunakan emoji secukupnya agar terasa lebih hidup
+- Gunakan format Markdown yang rapi saat cocok (judul #, subjudul ##, list bernomor/bullet, **bold**, dan blok kode)
+`;
+
+// ============================================================
+// CHAT HISTORY STORAGE (In-Memory per Session)
+// Key: sessionId (string), Value: array of messages
+// ============================================================
+const chatSessions = new Map();
+
+// Batas maksimal history per sesi agar tidak membebani context window
+const MAX_HISTORY_LENGTH = 20;
+
+// ============================================================
+// HELPER FUNCTIONS
+// ============================================================
+
+/**
+ * Mengambil atau membuat session baru berdasarkan sessionId
+ * @param {string} sessionId
+ * @returns {Array} array of conversation history
+ */
+function getSession(sessionId) {
+  if (!chatSessions.has(sessionId)) {
+    chatSessions.set(sessionId, []);
+  }
+  return chatSessions.get(sessionId);
+}
+
+/**
+ * Menambahkan pesan ke history session
+ * Jika melebihi MAX_HISTORY_LENGTH, hapus pesan paling lama (FIFO)
+ * @param {string} sessionId
+ * @param {string} role - 'user' atau 'model'
+ * @param {string} text
+ */
+function addToHistory(sessionId, role, text) {
+  const history = getSession(sessionId);
+  history.push({ role, parts: [{ text }] });
+
+  // Trim history jika terlalu panjang (jaga selalu berpasangan user-model)
+  if (history.length > MAX_HISTORY_LENGTH) {
+    history.splice(0, 2); // hapus 1 pasang pesan terlama
+  }
+}
+
+/**
+ * Memformat history ke format yang diterima Gemini API
+ * @param {Array} history
+ * @returns {Array}
+ */
+function formatHistoryForGemini(history) {
+  return history.map(({ role, parts }) => ({ role, parts }));
+}
+
+// ============================================================
+// EXPRESS APP
+// ============================================================
 const PORT = process.env.PORT || 3000;
-
-// Persiapan
-// - Inisialisasi Express dan Multer,
-// - Inisialisasi CORS
-
-// express() --> membuat instance aplikasi Express
 const app = express();
-
-// multer() --> membuat instance multer untuk handling upload file
 const upload = multer();
 
-// Inisialisasi Aplikasi
-
-// app.use() --> mendaftarkan middleware yang berlaku untuk semua route
-// express.json() --> middleware bawaan Express untuk mem-parse body request yang berformat JSON
 app.use(express.json());
 app.use(cors());
-app.use(express.static('public')); // untuk melayani file statis dari folder 'public'
+app.use(express.static('public'));
 
-// Mendefinisikan route POST pada endpoint '/generate'
-// async (request, response) => { ... } --> arrow function async sebagai handler route
-// 'request' = objek berisi data dari client, 'response' = objek untuk mengirim balasan ke client
+// ============================================================
+// ROUTE: POST /generate
+// Chat biasa TANPA history (single-turn)
+// ============================================================
 app.post('/generate', async (request, response) => {
-  // request.body --> mengambil body/payload dari request (sudah di-parse oleh express.json())
   const body = request.body;
 
-  // guard clause -- satpam payload
-  // Jika body.message kosong/undefined/null, kembalikan error 400 (Bad Request)
-  // return --> menghentikan eksekusi fungsi agar kode di bawahnya tidak jalan
-  // response.status(400) --> set HTTP status code 400
-  // .json() --> kirim response dalam format JSON
   if (!body.message) {
-    return response.status(400).json('belum ada pesan!');
+    return response.status(400).json({ error: 'Belum ada pesan!' });
   }
 
-  // guard clause 2 -- satpam tipe data
-  // typeof --> operator untuk mengecek tipe data sebuah variabel
-  // !== --> strict inequality (tidak sama dan harus tipe data yang sama)
   if (typeof body.message !== 'string') {
-    return response.status(400).json('pesannya harus teks ya!');
+    return response.status(400).json({ error: 'Pesan harus berupa teks!' });
   }
 
-  // try-catch --> menangkap error yang terjadi di dalam blok try
-  // Jika ada error, eksekusi lompat ke blok catch
   try {
-    // await --> menunggu Promise selesai sebelum lanjut ke baris berikutnya
-    // ai.models.generateContent() --> memanggil API Gemini untuk menghasilkan konten AI
-    // Parameter: model (model AI yang dipakai) dan contents (prompt/pesan dari user)
     const aiResponse = await ai.models.generateContent({
       model: MODELS.flash3,
-      contents: body.message
+      contents: body.message,
+      config: {
+        systemInstruction: SYSTEM_INSTRUCTION,
+        temperature: 0.7,
+        topK: 40,
+        topP: 0.95,
+      }
     });
 
-    // Status 200 --> OK (berhasil)
-    // aiResponse.text --> mengambil teks hasil generate dari AI
     return response.status(200).json({
       message: aiResponse.text,
       metadata: aiResponse.usageMetadata
     });
-  } catch (error) {
-    // console.log(error) --> mencetak error ke terminal untuk debugging
-    console.log(error);
 
-    // Status 500 --> Internal Server Error
-    // error.message --> mengambil pesan error yang terjadi
-    return response.status(500).json(error.message);
+  } catch (error) {
+    console.error('[/generate] Error:', error.message);
+    return response.status(500).json({ error: error.message });
   }
 });
 
+// ============================================================
+// ROUTE: POST /chat
+// Chat DENGAN history (multi-turn conversation)
+// Kirim { message: "...", sessionId: "..." }
+// sessionId digunakan untuk membedakan user yang berbeda
+// ============================================================
+app.post('/chat', async (request, response) => {
+  const body = request.body;
+
+  // Validasi input
+  if (!body.message) {
+    return response.status(400).json({ error: 'Belum ada pesan!' });
+  }
+
+  if (typeof body.message !== 'string') {
+    return response.status(400).json({ error: 'Pesan harus berupa teks!' });
+  }
+
+  // Gunakan sessionId dari client, atau buat default
+  // Idealnya sessionId digenerate di frontend dan disimpan di localStorage
+  const sessionId = body.sessionId || 'default-session';
+  const userMessage = body.message.trim();
+
+  // Ambil history sesi ini
+  const history = getSession(sessionId);
+
+  try {
+    // Gabungkan history + pesan baru user
+    const contents = [
+      ...formatHistoryForGemini(history),
+      { role: 'user', parts: [{ text: userMessage }] }
+    ];
+
+    const aiResponse = await ai.models.generateContent({
+      model: MODELS.flash3,
+      contents,
+      config: {
+        systemInstruction: SYSTEM_INSTRUCTION,
+        temperature: 0.7,
+        topK: 40,
+        topP: 0.95,
+      }
+    });
+
+    const replyText = aiResponse.text;
+
+    // Simpan pesan user dan balasan AI ke history
+    addToHistory(sessionId, 'user', userMessage);
+    addToHistory(sessionId, 'model', replyText);
+
+    return response.status(200).json({
+      message: replyText,
+      sessionId,
+      historyLength: getSession(sessionId).length / 2, // jumlah pasang pesan
+      metadata: aiResponse.usageMetadata
+    });
+
+  } catch (error) {
+    console.error('[/chat] Error:', error.message);
+    return response.status(500).json({ error: error.message });
+  }
+});
+
+// ============================================================
+// ROUTE: DELETE /chat/:sessionId
+// Hapus history sesi tertentu (reset conversation)
+// ============================================================
+app.delete('/chat/:sessionId', (request, response) => {
+  const { sessionId } = request.params;
+
+  if (chatSessions.has(sessionId)) {
+    chatSessions.delete(sessionId);
+    return response.status(200).json({ message: `Session ${sessionId} berhasil dihapus.` });
+  }
+
+  return response.status(404).json({ error: 'Session tidak ditemukan.' });
+});
+
+// ============================================================
+// ROUTE: GET /chat/:sessionId/history
+// Lihat history percakapan sesi tertentu
+// ============================================================
+app.get('/chat/:sessionId/history', (request, response) => {
+  const { sessionId } = request.params;
+  const history = getSession(sessionId);
+
+  return response.status(200).json({
+    sessionId,
+    totalMessages: history.length,
+    history: history.map(({ role, parts }) => ({
+      role,
+      text: parts[0].text
+    }))
+  });
+});
+
+// ============================================================
+// ROUTE: POST /generate/text-from-image
+// Generate teks dari gambar + prompt
+// ============================================================
 app.post('/generate/text-from-image', upload.single('image'), async (request, response) => {
   const body = request.body;
- 
-  // guard clause -- satpam payload
+
   if (!body.message || !request.file) {
-    return response.status(400).json('File dan pesan harus lengkap!');
+    return response.status(400).json({ error: 'File dan pesan harus lengkap!' });
   }
- 
-  // guard clause 2 -- satpam tipe data
+
   if (typeof body.message !== 'string') {
-    return response.status(400).json('pesannya harus teks ya!');
+    return response.status(400).json({ error: 'Pesan harus berupa teks!' });
   }
- 
-  // kita pecah request.body-nya di sini
+
   const text = body.message;
   const file = request.file;
   const base64Image = file.buffer.toString('base64');
   const fileType = file.mimetype;
- 
-  // try --> "markicob" (mari kita 'coba')
+
   try {
-    // siapkan AI response
     const aiResponse = await ai.models.generateContent({
       model: MODELS.flashLite31,
       contents: [
         { text, type: "text" },
         { inlineData: { data: base64Image, mimeType: fileType } }
-      ]
+      ],
+      config: { systemInstruction: SYSTEM_INSTRUCTION }
     });
- 
+
     return response.status(200).json({
       message: aiResponse.text,
       metadata: aiResponse.usageMetadata
     });
+
   } catch (error) {
-    console.log(error);
- 
-    return response.status(500).json(error.message);
+    console.error('[/generate/text-from-image] Error:', error.message);
+    return response.status(500).json({ error: error.message });
   }
 });
 
+// ============================================================
+// ROUTE: POST /generate/text-from-doc
+// Generate teks dari dokumen + prompt
+// ============================================================
 app.post('/generate/text-from-doc', upload.single('doc'), async (request, response) => {
   const body = request.body;
- 
-  // guard clause -- satpam payload
+
   if (!body.message || !request.file) {
-    return response.status(400).json('File dan pesan harus lengkap!');
+    return response.status(400).json({ error: 'File dan pesan harus lengkap!' });
   }
- 
-  // guard clause 2 -- satpam tipe data
+
   if (typeof body.message !== 'string') {
-    return response.status(400).json('pesannya harus teks ya!');
+    return response.status(400).json({ error: 'Pesan harus berupa teks!' });
   }
- 
-  // kita pecah request.body-nya di sini
+
   const text = body.message;
   const file = request.file;
   const base64Doc = file.buffer.toString('base64');
   const fileType = file.mimetype;
- 
-  // try --> "markicob" (mari kita 'coba')
+
   try {
-    // siapkan AI response
     const aiResponse = await ai.models.generateContent({
       model: MODELS.flashLite31,
       contents: [
         { text, type: "text" },
         { inlineData: { data: base64Doc, mimeType: fileType } }
-      ]
+      ],
+      config: { systemInstruction: SYSTEM_INSTRUCTION }
     });
- 
+
     return response.status(200).json({
       message: aiResponse.text,
       metadata: aiResponse.usageMetadata
     });
-  } catch (error) {
-    console.log(error);
 
-    return response.status(500).json(error.message);
+  } catch (error) {
+    console.error('[/generate/text-from-doc] Error:', error.message);
+    return response.status(500).json({ error: error.message });
   }
 });
 
+// ============================================================
+// ROUTE: POST /generate/text-from-audio
+// Generate teks dari audio + prompt
+// ============================================================
 app.post('/generate/text-from-audio', upload.single('audio'), async (request, response) => {
   const body = request.body;
- 
-  // guard clause -- satpam payload
+
   if (!body.message || !request.file) {
-    return response.status(400).json('File dan pesan harus lengkap!');
+    return response.status(400).json({ error: 'File dan pesan harus lengkap!' });
   }
- 
-  // guard clause 2 -- satpam tipe data
+
   if (typeof body.message !== 'string') {
-    return response.status(400).json('pesannya harus teks ya!');
+    return response.status(400).json({ error: 'Pesan harus berupa teks!' });
   }
- 
-  // kita pecah request.body-nya di sini
+
   const text = body.message;
   const file = request.file;
   const base64Audio = file.buffer.toString('base64');
   const fileType = file.mimetype;
- 
-  // try --> "markicob" (mari kita 'coba')
+
   try {
-    // siapkan AI response
     const aiResponse = await ai.models.generateContent({
       model: MODELS.flashLite31,
       contents: [
         { text, type: "text" },
         { inlineData: { data: base64Audio, mimeType: fileType } }
-      ]
+      ],
+      config: { systemInstruction: SYSTEM_INSTRUCTION }
     });
- 
+
     return response.status(200).json({
       message: aiResponse.text,
       metadata: aiResponse.usageMetadata
     });
+
   } catch (error) {
-    console.log(error.status);
-    if (error.status === 400) {
-      return response.status(400).json('Format audio tidak didukung!');
-    }
-    if (error.status === 401) {
-      return response.status(401).json('Unauthorized, periksa API key Anda!');
-    }
-    if (error.status === 403) {
-      return response.status(403).json('Anda tidak memiliki izin untuk mengakses layanan AI!');
-    }
-    if (error.status === 413) {
-      return response.status(413).json('File audio terlalu besar!');
-    }
-    if (error.status === 415) {
-      return response.status(415).json('Tipe file audio tidak didukung!');
-    }
-    if (error.status === 429) {
-      return response.status(429).json('Terlalu banyak permintaan, coba lagi nanti!');
-    }
-    if (error.status === 500) {
-      return response.status(500).json('Terjadi kesalahan pada server AI!');
-    }
-    if (error.status === 503) {
-      return response.status(503).json('Layanan AI sedang tidak tersedia, coba lagi nanti!');
-    }
-    return response.status(500).json(error.message);
+    console.error('[/generate/text-from-audio] Error:', error.status, error.message);
+
+    const statusMap = {
+      400: 'Format audio tidak didukung!',
+      401: 'Unauthorized, periksa API key Anda!',
+      403: 'Anda tidak memiliki izin untuk mengakses layanan AI!',
+      413: 'File audio terlalu besar!',
+      415: 'Tipe file audio tidak didukung!',
+      429: 'Terlalu banyak permintaan, coba lagi nanti!',
+      500: 'Terjadi kesalahan pada server AI!',
+      503: 'Layanan AI sedang tidak tersedia, coba lagi nanti!',
+    };
+
+    const status = error.status || 500;
+    const message = statusMap[status] || error.message;
+    return response.status(status).json({ error: message });
   }
 });
 
-// Route untuk upload dokumen (belum diimplementasi, masih di-comment)
-// upload.single('docs') --> middleware multer untuk menerima 1 file dengan field name 'docs'
-// app.post('/generate/doc', upload.single('docs'), async () => {});
-
-// app.listen() --> menjalankan server dan mulai mendengarkan request pada port yang ditentukan
-// Callback function dipanggil ketika server berhasil berjalan
+// ============================================================
+// START SERVER
+// ============================================================
 app.listen(PORT, () => {
-  console.log("I LOVE YOU", PORT);
+  console.log(`🚀 Server running on http://localhost:${PORT}`);
+  console.log(`🤖 AI Persona: Tomas (Gemini ${MODELS.flash3})`);
+  console.log(`📝 Max history per session: ${MAX_HISTORY_LENGTH} messages`);
 });
-
-
-
-
-// async function main() {
-//   const response = await ai.models.generateContent({
-//     model: "gemini-3-flash-preview",
-//     contents: "Explain how AI works in a few words",
-//   });
-//   console.log(response.text);
-// }
-
-// main();
